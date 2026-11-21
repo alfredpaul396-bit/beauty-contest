@@ -6,9 +6,8 @@
 import csv
 import hashlib
 import io
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from statistics import mean
-from zoneinfo import ZoneInfo
 
 import pandas as pd
 import requests
@@ -16,15 +15,12 @@ import streamlit as st
 
 # ----------------------------------------------------------------------------
 # Configuration
-# Set these in Streamlit Cloud → App settings → Secrets (or .streamlit/secrets.toml):
+# Set this in Streamlit Cloud → App settings → Secrets (or .streamlit/secrets.toml):
 #   API_URL = "https://script.google.com/macros/s/XXXX/exec"
-#   COMMIT_DEADLINE = "2026-11-15 23:59:59"      # Europe/Paris local time
 # ----------------------------------------------------------------------------
 APP_NAME = "Beauty Contest"
-PARIS = ZoneInfo("Europe/Paris")
 
 API_DEFAULT = "https://script.google.com/macros/s/REPLACE_WITH_YOUR_/exec"
-COMMIT_DEADLINE_DEFAULT = "2026-11-15 23:59:59"  # Paris time, from the course PRD
 
 K_FACTOR = 2 / 3
 ALLOWED_MIN, ALLOWED_MAX = 0, 100
@@ -39,11 +35,6 @@ def get_secret(key, default):
 
 
 API_URL = get_secret("API_URL", API_DEFAULT)
-COMMIT_DEADLINE_PARIS = datetime.strptime(
-    get_secret("COMMIT_DEADLINE", COMMIT_DEADLINE_DEFAULT), "%Y-%m-%d %H:%M:%S"
-).replace(tzinfo=PARIS)
-COMMIT_DEADLINE_UTC = COMMIT_DEADLINE_PARIS.astimezone(timezone.utc)
-REVEAL_OPEN_UTC = COMMIT_DEADLINE_UTC + timedelta(seconds=1)
 
 
 # ----------------------------------------------------------------------------
@@ -53,20 +44,12 @@ def sha256(s: str) -> str:
     return hashlib.sha256(s.encode("utf-8")).hexdigest()
 
 
-def now_utc():
-    return datetime.now(timezone.utc)
-
-
 def parse_ts(ts: str):
     try:
         d = datetime.fromisoformat(ts.replace("Z", "+00:00"))
         return d if d.tzinfo else d.replace(tzinfo=timezone.utc)
     except Exception:
         return None
-
-
-def fmt(d: datetime) -> str:
-    return d.strftime("%d %b %Y, %H:%M:%S")
 
 
 def post_to_ledger(api: str, payload: dict):
@@ -245,11 +228,6 @@ with st.sidebar:
     st.caption("Guess a number from 0 to 100. Closest to ⅔ of the class average wins.")
     api = st.text_input("Ledger API URL (ends with /exec)", value=API_URL).strip()
     st.divider()
-    commit_open = now_utc() <= COMMIT_DEADLINE_UTC
-    st.markdown(f"**Commit deadline (Paris):** {fmt(COMMIT_DEADLINE_PARIS)}")
-    st.markdown(f"**Commit deadline (UTC):** {fmt(COMMIT_DEADLINE_UTC)}")
-    st.markdown("**Status:** " + ("🟢 Commit open" if commit_open else "🔵 Reveal open"))
-    st.divider()
     st.caption("Public ledger: append `?table=commits` or `?table=reveals` to the API URL.")
 
 st.title(f"🎯 {APP_NAME}")
@@ -267,85 +245,69 @@ with tab_commit:
         "`sha256(uni_id|number|nonce)` is sent to the ledger, so your guess stays hidden."
     )
 
-    if now_utc() > COMMIT_DEADLINE_UTC:
-        st.error(
-            f"⛔ Commit window is CLOSED.  \n"
-            f"Deadline (Paris): {fmt(COMMIT_DEADLINE_PARIS)}  \n"
-            f"Deadline (UTC): {fmt(COMMIT_DEADLINE_UTC)}"
+    with st.form("commit_form"):
+        c_uid = st.text_input("Your University ID")
+        c_num = st.number_input("Choose your number (0..100)", min_value=0, max_value=100, step=1, value=0)
+        c_nonce = st.text_input("Choose a secret nonce (keep it safe)", type="password")
+        c_submit = st.form_submit_button("Submit commit", type="primary")
+
+    if c_submit:
+        uid, nonce = c_uid.strip(), c_nonce.strip()
+        number, err = valid_inputs(uid, c_num, nonce)
+        if err:
+            st.error(err)
+        else:
+            preimage = f"{uid}|{number}|{nonce}"
+            commit_hash = sha256(preimage)
+            code, text = post_to_ledger(api, {"kind": "commit", "uni_id": uid, "commit": commit_hash})
+            st.session_state["last_commit"] = {
+                "preimage": preimage, "hash": commit_hash, "code": code, "text": text,
+            }
+
+    lc = st.session_state.get("last_commit")
+    if lc:
+        if lc["code"] and 200 <= lc["code"] < 300:
+            st.success(f"Commit sent. Server: {lc['code']} {lc['text']}")
+        else:
+            st.error(f"Commit may not have been recorded. Server: {lc['code']} {lc['text']}")
+        st.markdown("**Your commit hash**")
+        st.code(lc["hash"], language=None)
+        st.markdown("**Write this down — you must re-enter it at reveal:**")
+        st.code(f"PREIMAGE: {lc['preimage']}", language=None)
+        st.download_button(
+            "Download my preimage",
+            data=f"PREIMAGE: {lc['preimage']}\nCOMMIT: {lc['hash']}\n",
+            file_name="my_beauty_contest_preimage.txt",
         )
-    else:
-        with st.form("commit_form"):
-            c_uid = st.text_input("Your University ID")
-            c_num = st.number_input("Choose your number (0..100)", min_value=0, max_value=100, step=1, value=0)
-            c_nonce = st.text_input("Choose a secret nonce (keep it safe)", type="password")
-            c_submit = st.form_submit_button("Submit commit", type="primary")
-
-        if c_submit:
-            uid, nonce = c_uid.strip(), c_nonce.strip()
-            number, err = valid_inputs(uid, c_num, nonce)
-            if err:
-                st.error(err)
-            elif now_utc() > COMMIT_DEADLINE_UTC:
-                st.error("⛔ Commit window closed while you were typing.")
-            else:
-                preimage = f"{uid}|{number}|{nonce}"
-                commit_hash = sha256(preimage)
-                code, text = post_to_ledger(api, {"kind": "commit", "uni_id": uid, "commit": commit_hash})
-                st.session_state["last_commit"] = {
-                    "preimage": preimage, "hash": commit_hash, "code": code, "text": text,
-                }
-
-        lc = st.session_state.get("last_commit")
-        if lc:
-            if lc["code"] and 200 <= lc["code"] < 300:
-                st.success(f"Commit sent. Server: {lc['code']} {lc['text']}")
-            else:
-                st.error(f"Commit may not have been recorded. Server: {lc['code']} {lc['text']}")
-            st.markdown("**Your commit hash**")
-            st.code(lc["hash"], language=None)
-            st.markdown("**Write this down — you must re-enter it at reveal:**")
-            st.code(f"PREIMAGE: {lc['preimage']}", language=None)
-            st.download_button(
-                "Download my preimage",
-                data=f"PREIMAGE: {lc['preimage']}\nCOMMIT: {lc['hash']}\n",
-                file_name="my_beauty_contest_preimage.txt",
-            )
-            st.caption("You can commit again before the deadline. The latest commit counts.")
+        st.caption("You can commit again. Your latest commit before your reveal counts.")
 
 # ---------------- Reveal ----------------
 with tab_reveal:
     st.subheader("Reveal")
-    st.write("Re-enter **exactly** what you committed. Anyone can then recompute your hash and verify it.")
+    st.write("Reveal when your instructor says so, re-entering **exactly** what you committed. Anyone can then recompute your hash and verify it.")
 
-    if now_utc() < REVEAL_OPEN_UTC:
-        st.error(
-            f"⛔ Reveal window is NOT open yet.  \n"
-            f"Reveal opens after the commit deadline ({fmt(COMMIT_DEADLINE_PARIS)} Paris).  \n"
-            "The reveal is done together in class."
-        )
-    else:
-        with st.form("reveal_form"):
-            r_uid = st.text_input("Your University ID")
-            r_num = st.number_input("Your number (0..100)", min_value=0, max_value=100, step=1, value=0)
-            r_nonce = st.text_input("Your secret nonce", type="password")
-            r_submit = st.form_submit_button("Submit reveal", type="primary")
+    with st.form("reveal_form"):
+        r_uid = st.text_input("Your University ID")
+        r_num = st.number_input("Your number (0..100)", min_value=0, max_value=100, step=1, value=0)
+        r_nonce = st.text_input("Your secret nonce", type="password")
+        r_submit = st.form_submit_button("Submit reveal", type="primary")
 
-        if r_submit:
-            uid, nonce = r_uid.strip(), r_nonce.strip()
-            number, err = valid_inputs(uid, r_num, nonce)
-            if err:
-                st.error(err)
+    if r_submit:
+        uid, nonce = r_uid.strip(), r_nonce.strip()
+        number, err = valid_inputs(uid, r_num, nonce)
+        if err:
+            st.error(err)
+        else:
+            code, text = post_to_ledger(
+                api, {"kind": "reveal", "uni_id": uid, "number": number, "nonce": nonce}
+            )
+            if code and 200 <= code < 300:
+                st.success(f"Reveal sent. Server: {code} {text}")
             else:
-                code, text = post_to_ledger(
-                    api, {"kind": "reveal", "uni_id": uid, "number": number, "nonce": nonce}
-                )
-                if code and 200 <= code < 300:
-                    st.success(f"Reveal sent. Server: {code} {text}")
-                else:
-                    st.error(f"Reveal may not have been recorded. Server: {code} {text}")
-                st.markdown("**Hash of what you revealed** (should match your commit):")
-                st.code(sha256(f"{uid}|{number}|{nonce}"), language=None)
-                st.caption("You can reveal again. The latest reveal is matched to your latest prior commit.")
+                st.error(f"Reveal may not have been recorded. Server: {code} {text}")
+            st.markdown("**Hash of what you revealed** (should match your commit):")
+            st.code(sha256(f"{uid}|{number}|{nonce}"), language=None)
+            st.caption("You can reveal again. The latest reveal is matched to your latest prior commit.")
 
 # ---------------- Results ----------------
 with tab_results:

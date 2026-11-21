@@ -52,17 +52,41 @@ def parse_ts(ts: str):
         return None
 
 
+def ledger_url_problem(api: str):
+    """Return an error message if the ledger URL is missing or still the placeholder."""
+    if not api or "REPLACE_WITH_YOUR_" in api:
+        return "No ledger API URL set yet. Paste the /exec link from your instructor in the sidebar."
+    if not api.startswith("https://") or not api.rstrip("/").endswith("/exec"):
+        return "The ledger API URL should start with https:// and end with /exec."
+    return None
+
+
+def short_reply(text: str) -> str:
+    """Keep server replies readable: hide HTML error pages, trim long text."""
+    t = (text or "").strip()
+    if t.lower().startswith("<!doctype") or t.lower().startswith("<html"):
+        return "(the server returned a web page instead of a ledger reply)"
+    return t if len(t) <= 300 else t[:300] + "…"
+
+
 def post_to_ledger(api: str, payload: dict):
+    """Returns (ok, message)."""
     try:
         r = requests.post(api, json=payload, timeout=15)
-        return r.status_code, r.text
     except Exception as e:
-        return None, f"Network error: {e}"
+        return False, f"Could not reach the ledger: {e}"
+    if 200 <= r.status_code < 300:
+        return True, short_reply(r.text)
+    hint = " Check the ledger API URL." if r.status_code in (401, 403, 404) else ""
+    return False, f"HTTP {r.status_code} {short_reply(r.text)}{hint}"
 
 
 def get_csv(url: str):
     r = requests.get(url, timeout=20)
-    r.raise_for_status()
+    if r.status_code != 200:
+        raise RuntimeError(f"HTTP {r.status_code} from the ledger. Check the ledger API URL.")
+    if r.text.lstrip().lower().startswith(("<!doctype", "<html")):
+        raise RuntimeError("The ledger returned a web page instead of CSV. Check the ledger API URL.")
     return list(csv.DictReader(io.StringIO(r.text)))
 
 
@@ -232,8 +256,9 @@ with st.sidebar:
 
 st.title(f"🎯 {APP_NAME}")
 
-if "REPLACE_WITH_YOUR_" in api:
-    st.warning("Set the ledger API URL in the sidebar (or as `API_URL` in Streamlit secrets).")
+url_problem = ledger_url_problem(api)
+if url_problem:
+    st.warning(url_problem)
 
 tab_commit, tab_reveal, tab_results = st.tabs(["Commit", "Reveal", "Results"])
 
@@ -256,20 +281,22 @@ with tab_commit:
         number, err = valid_inputs(uid, c_num, nonce)
         if err:
             st.error(err)
+        elif url_problem:
+            st.error(f"Commit not sent. {url_problem}")
         else:
             preimage = f"{uid}|{number}|{nonce}"
             commit_hash = sha256(preimage)
-            code, text = post_to_ledger(api, {"kind": "commit", "uni_id": uid, "commit": commit_hash})
+            ok, msg = post_to_ledger(api, {"kind": "commit", "uni_id": uid, "commit": commit_hash})
             st.session_state["last_commit"] = {
-                "preimage": preimage, "hash": commit_hash, "code": code, "text": text,
+                "preimage": preimage, "hash": commit_hash, "ok": ok, "msg": msg,
             }
 
     lc = st.session_state.get("last_commit")
     if lc:
-        if lc["code"] and 200 <= lc["code"] < 300:
-            st.success(f"Commit sent. Server: {lc['code']} {lc['text']}")
+        if lc["ok"]:
+            st.success(f"Commit recorded. Server: {lc['msg']}")
         else:
-            st.error(f"Commit may not have been recorded. Server: {lc['code']} {lc['text']}")
+            st.error(f"Commit NOT recorded. {lc['msg']}")
         st.markdown("**Your commit hash**")
         st.code(lc["hash"], language=None)
         st.markdown("**Write this down — you must re-enter it at reveal:**")
@@ -297,14 +324,16 @@ with tab_reveal:
         number, err = valid_inputs(uid, r_num, nonce)
         if err:
             st.error(err)
+        elif url_problem:
+            st.error(f"Reveal not sent. {url_problem}")
         else:
-            code, text = post_to_ledger(
+            ok, msg = post_to_ledger(
                 api, {"kind": "reveal", "uni_id": uid, "number": number, "nonce": nonce}
             )
-            if code and 200 <= code < 300:
-                st.success(f"Reveal sent. Server: {code} {text}")
+            if ok:
+                st.success(f"Reveal recorded. Server: {msg}")
             else:
-                st.error(f"Reveal may not have been recorded. Server: {code} {text}")
+                st.error(f"Reveal NOT recorded. {msg}")
             st.markdown("**Hash of what you revealed** (should match your commit):")
             st.code(sha256(f"{uid}|{number}|{nonce}"), language=None)
             st.caption("You can reveal again. The latest reveal is matched to your latest prior commit.")
@@ -319,6 +348,9 @@ with tab_results:
     )
 
     if st.button("Compute results from ledger", type="primary"):
+        if url_problem:
+            st.error(url_problem)
+            st.stop()
         try:
             with st.spinner("Downloading commits and reveals…"):
                 commits_raw = get_csv(f"{api}?table=commits")
